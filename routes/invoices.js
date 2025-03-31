@@ -2,15 +2,16 @@ const express = require("express");
 const router = express.Router();
 const multer = require("multer");
 const fs = require("fs");
+const path = require("path");
 const pdfParse = require("pdf-parse");
 const mysql = require("mysql2/promise");
-const verifyToken = require("../middleware/auth");
-const Stripe = require("stripe");
+const authenticateToken = require("../middleware/auth");
 require("dotenv").config();
 
-const stripe = Stripe(process.env.STRIPE_SECRET_KEY);
+// ✅ Multer setup for invoice upload
 const upload = multer({ dest: "uploads/" });
 
+// ✅ Database config
 const dbConfig = {
   host: process.env.DB_HOST,
   user: process.env.DB_USER,
@@ -18,117 +19,135 @@ const dbConfig = {
   database: process.env.DB_NAME,
 };
 
-// Upload invoice (JWT secured)
-router.post("/upload", verifyToken, upload.single("invoice"), async (req, res) => {
+// 📥 Upload PDF invoice and parse contents
+router.post("/upload", authenticateToken, upload.single("invoice"), async (req, res) => {
   const filePath = req.file.path;
   const userId = req.user.id;
-  const utilityType = "electric"; // Later make dynamic
-  const unitType = utilityType === "water" ? "m³" : "kWh";
-  const ratePerUnit = 0.34;
+  const utilityType = req.body.utilityType || "electric"; // Can be gas or water
 
   try {
     const dataBuffer = fs.readFileSync(filePath);
     const pdfData = await pdfParse(dataBuffer);
     const text = pdfData.text;
 
+    // Basic parsing logic
     const periodMatch = text.match(/(\d{2}\/\d{2}\/\d{4})\s*-\s*(\d{2}\/\d{2}\/\d{4})/);
-    const usageMatch = text.match(/([\d,.]+)\s*kWh/);
-    const provider = "Sample Energy Co";
-    const account = "ACC12345678";
+    const usageMatch = text.match(/([\d,.]+)\s*(kWh|m3)/i);
+    const costMatch = text.match(/£([\d,.]+)/);
 
-    const billingStart = periodMatch ? periodMatch[1] : null;
-    const billingEnd = periodMatch ? periodMatch[2] : null;
+    const billing_period_start = periodMatch ? periodMatch[1] : null;
+    const billing_period_end = periodMatch ? periodMatch[2] : null;
     const usage = usageMatch ? parseFloat(usageMatch[1].replace(",", "")) : null;
-
-    const subtotal = usage ? parseFloat((usage * ratePerUnit).toFixed(2)) : null;
-    const markup = subtotal ? parseFloat((subtotal * 0.10).toFixed(2)) : null;
-    const totalCost = subtotal && markup ? parseFloat((subtotal + markup).toFixed(2)) : null;
+    const unit_type = usageMatch ? usageMatch[2] : null;
+    const subtotal = costMatch ? parseFloat(costMatch[1].replace(",", "")) : null;
+    const markup = subtotal ? parseFloat((subtotal * 0.10).toFixed(2)) : 0;
+    const total_cost = subtotal ? parseFloat((subtotal + markup).toFixed(2)) : null;
 
     const connection = await mysql.createConnection(dbConfig);
     await connection.execute(
-      `INSERT INTO invoices 
-      (user_id, utility_type, provider_name, account_number, billing_period_start, billing_period_end, \`usage\`, unit_type, rate_per_unit, subtotal, markup, total_cost)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO invoices (
+        user_id, utility_type, billing_period_start, billing_period_end,
+        usage, unit_type, subtotal, markup, total_cost
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         userId,
         utilityType,
-        provider,
-        account,
-        billingStart,
-        billingEnd,
+        billing_period_start,
+        billing_period_end,
         usage,
-        unitType,
-        ratePerUnit,
+        unit_type,
         subtotal,
         markup,
-        totalCost
+        total_cost,
       ]
     );
-
     await connection.end();
+
     fs.unlinkSync(filePath);
 
     res.status(200).json({
-      message: "Invoice uploaded and processed",
-      billing_period_start: billingStart,
-      billing_period_end: billingEnd,
+      message: "Invoice uploaded and processed successfully",
+      billing_period_start,
+      billing_period_end,
       usage,
-      unit_type: unitType,
+      unit_type,
       subtotal,
       markup,
-      total_cost: totalCost,
+      total_cost,
     });
   } catch (err) {
-    console.error(err);
+    console.error("Upload Error:", err);
     res.status(500).json({ message: "Failed to process invoice" });
   }
 });
 
-// Stripe payment session
-router.post("/pay/:invoiceId", verifyToken, async (req, res) => {
-  const userId = req.user.id;
-  const invoiceId = req.params.invoiceId;
+// 📊 Consolidate monthly invoices and apply markup
+router.post("/consolidate/:userId", authenticateToken, async (req, res) => {
+  const userId = req.params.userId;
 
   try {
     const connection = await mysql.createConnection(dbConfig);
-    const [rows] = await connection.execute(
-      "SELECT * FROM monthly_invoices WHERE id = ? AND user_id = ?",
-      [invoiceId, userId]
-    );
+    const [results] = await connection.execute(`
+      SELECT 
+        MONTH(STR_TO_DATE(billing_period_start, '%d/%m/%Y')) AS month,
+        YEAR(STR_TO_DATE(billing_period_start, '%d/%m/%Y')) AS year,
+        SUM(usage) AS total_usage,
+        unit_type,
+        SUM(subtotal) AS subtotal,
+        SUM(markup) AS total_markup,
+        SUM(total_cost) AS total_cost
+      FROM invoices
+      WHERE user_id = ?
+      GROUP BY year, month, unit_type
+    `, [userId]);
 
-    if (rows.length === 0) {
-      return res.status(404).json({ message: "Invoice not found" });
+    for (const row of results) {
+      await connection.execute(`
+        INSERT INTO monthly_invoices (user_id, month, year, total_usage, usage_unit, total_cost_before_markup, total_markup, total_cost_with_markup)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON DUPLICATE KEY UPDATE 
+          total_usage = VALUES(total_usage),
+          total_cost_before_markup = VALUES(total_cost_before_markup),
+          total_markup = VALUES(total_markup),
+          total_cost_with_markup = VALUES(total_cost_with_markup)
+      `, [
+        userId,
+        row.month,
+        row.year,
+        row.total_usage,
+        row.unit_type,
+        row.subtotal,
+        row.total_markup,
+        row.total_cost
+      ]);
     }
 
-    const invoice = rows[0];
+    await connection.end();
+    res.json({ message: "Monthly invoices consolidated", data: results });
+  } catch (error) {
+    console.error("Consolidation Error:", error);
+    res.status(500).json({ message: "Error consolidating invoices" });
+  }
+});
 
-    const session = await stripe.checkout.sessions.create({
-      payment_method_types: ["card"],
-      line_items: [
-        {
-          price_data: {
-            currency: "gbp",
-            product_data: {
-              name: `Billhub Invoice - ${invoice.month}/${invoice.year}`,
-            },
-            unit_amount: Math.round(invoice.total_cost_with_markup * 100),
-          },
-          quantity: 1,
-        },
-      ],
-      mode: "payment",
-      success_url: "http://localhost:3000/payment-success",
-      cancel_url: "http://localhost:3000/payment-cancelled",
-      metadata: {
-        invoice_id: invoiceId,
-        user_id: userId
-      }
-    });
+// 📄 View consolidated monthly invoices
+router.get("/monthly/:userId", authenticateToken, async (req, res) => {
+  const userId = req.params.userId;
 
-    res.json({ url: session.url });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ message: "Payment session failed" });
+  try {
+    const connection = await mysql.createConnection(dbConfig);
+    const [invoices] = await connection.execute(`
+      SELECT id, month, year, total_usage, usage_unit, total_cost_with_markup, paid_status, created_at
+      FROM monthly_invoices
+      WHERE user_id = ?
+      ORDER BY year DESC, month DESC
+    `, [userId]);
+
+    await connection.end();
+    res.json({ invoices });
+  } catch (error) {
+    console.error("Fetch Monthly Error:", error);
+    res.status(500).json({ message: "Error fetching monthly invoices" });
   }
 });
 
